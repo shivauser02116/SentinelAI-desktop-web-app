@@ -1,0 +1,779 @@
+/**
+ * SessionController — single source of truth for all session state.
+ *
+ * Wraps the Gateway, SimulatedAgent, and AuditLog. Notifies React via
+ * a subscribe() pattern. All UI timing is driven by setTimeout so React
+ * never blocks on async work.
+ */
+import { Gateway } from '../gateway/gateway'
+import { issueGrant } from '../gateway/grants'
+import { getUserByRole, getUser } from '../gateway/mockDb'
+import { verifyChain as gwVerifyChain, type GatewayAuditEntry } from '../gateway/audit'
+import { tamperDemo as doTamper, reset as resetTamper } from '../demo/tamper'
+import { SimulatedAgent } from '../agent/simulatedAgent'
+import { SCENARIOS, USERS, RECORDS, DEMO_DATE, GRANT_EXPIRES } from '../data/scenarios'
+import type {
+  User,
+  TaskGrant,
+  ActionEvent,
+  ApprovalRequest,
+  AuditEntry,
+  Activity,
+  Toast,
+  ArgValue,
+  ToolName,
+  Check,
+} from '../types'
+import type { ToolCall, EvalContext, Role } from '../gateway/types'
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+interface ControllerSnapshot {
+  currentTask: TaskGrant | null
+  currentUser: User
+  events: ActionEvent[]
+  approvals: ApprovalRequest[]
+  auditEntries: AuditEntry[]
+  chainOk: boolean
+  chainBrokenAt: number | null
+  runningId: string | null
+  doneIds: string[]
+  selectedEventId: string | null
+  activity: Activity | null
+  toast: Toast | null
+  liveMessage: string
+}
+
+type SubscriberFn = (snap: ControllerSnapshot) => void
+
+// ── Options (allow test overrides) ────────────────────────────────────────────
+
+export interface ControllerOptions {
+  /**
+   * [agentMsg, agentCall, evaluating, decision, finalize]
+   * Default: [600, 600, 600, 600, 400] which reproduces the 0/600/1200/1800/2200 timing.
+   * Tests pass [0, 0, 0, 0, 0] to run synchronously.
+   */
+  delays?: [number, number, number, number, number]
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+const CHECK_NAMES: Record<string, string> = {
+  role_access: 'Role access',
+  task_scope: 'Task scope',
+  arg_limits: 'Argument limits',
+}
+
+function formatTimeLeft(expiresAt: Date): string {
+  const diffMs = Math.max(0, expiresAt.getTime() - Date.now())
+  const totalSec = Math.floor(diffMs / 1000)
+  const m = Math.floor(totalSec / 60)
+  const s = totalSec % 60
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')} left`
+}
+
+let _toastSeq = 0
+
+// ── Controller ────────────────────────────────────────────────────────────────
+
+export class SessionController {
+  private readonly _gw = new Gateway()
+  private readonly _agent: SimulatedAgent
+  private readonly _delays: [number, number, number, number, number]
+  private readonly _subscribers = new Set<SubscriberFn>()
+
+  private _snap: ControllerSnapshot = {
+    currentTask: null,
+    currentUser: USERS.rohan,
+    events: [],
+    approvals: [],
+    auditEntries: [],
+    chainOk: true,
+    chainBrokenAt: null,
+    runningId: null,
+    doneIds: [],
+    selectedEventId: null,
+    activity: null,
+    toast: null,
+    liveMessage: '',
+  }
+
+  // Internal tracking maps for approval resolution
+  private _approvalToScenario = new Map<string, string>() // approvalId → scenarioId
+  private _currentGrant: ReturnType<typeof issueGrant> | null = null
+  private _countdownInterval: ReturnType<typeof setInterval> | null = null
+  private _toastTimeout: ReturnType<typeof setTimeout> | null = null
+  private _timers: ReturnType<typeof setTimeout>[] = []
+  private _eventSeq = 0
+
+  constructor(opts?: ControllerOptions) {
+    this._delays = opts?.delays ?? [600, 600, 600, 600, 400]
+    this._agent = new SimulatedAgent([0, 0]) // agent delays are handled by controller
+  }
+
+  // ── Public API ─────────────────────────────────────────────────────────────
+
+  getSnapshot(): ControllerSnapshot {
+    return this._snap
+  }
+
+  subscribe(fn: SubscriberFn): () => void {
+    this._subscribers.add(fn)
+    return () => this._subscribers.delete(fn)
+  }
+
+  selectEvent(id: string | null): void {
+    this._patch({ selectedEventId: id })
+  }
+
+  dismissToast(): void {
+    this._patch({ toast: null })
+  }
+
+  requestLiveMode(): void {
+    this._showToast({ message: "Live LLM mode isn't configured" })
+  }
+
+  // ── runScenario (fire-and-forget from React) ───────────────────────────────
+
+  runScenario(id: string): void {
+    const sc = SCENARIOS.find((s) => s.id === id)
+    if (!sc || this._snap.runningId) return
+    this._runScenarioInternal(sc)
+  }
+
+  /**
+   * Awaitable version for tests — skips setTimeout, runs all steps sequentially.
+   */
+  async runScenarioSync(id: string): Promise<void> {
+    const sc = SCENARIOS.find((s) => s.id === id)
+    if (!sc) return
+
+    // Issue grant
+    const userId =
+      sc.id === 's5' ? 'u-priya' : 'u-rohan'
+    const allowTools: ToolName[] =
+      sc.id === 's5'
+        ? ['invoice.lookup', 'refund.issue']
+        : ['invoice.lookup', 'refund.issue']
+    const gwGrant = issueGrant({
+      taskId: sc.taskId,
+      userId,
+      allowTools,
+      allowResources: ['C-204'],
+    })
+    this._currentGrant = gwGrant
+
+    // Build UI task grant
+    const uiGrant = this._buildUIGrant(sc, gwGrant)
+
+    // Set initial state
+    const eventId = `EVT-${String(++this._eventSeq).padStart(3, '0')}`
+    const gwUser = getUser(gwGrant.userId)!
+    this._patch({
+      currentUser: sc.user,
+      currentTask: uiGrant,
+      activity: { scenarioId: id, stage: 1 },
+      runningId: id,
+    })
+
+    // Stage 2 — agent message received
+    this._patch({ activity: { scenarioId: id, stage: 2 } })
+
+    // Stage 3 — evaluating
+    const evaluatingEvent: ActionEvent = {
+      id: eventId,
+      scenarioId: id,
+      scenarioNumber: sc.number,
+      time: sc.time,
+      requestedBy: sc.user,
+      taskId: sc.taskId,
+      call: sc.call,
+      decision: sc.decision,
+      rule: sc.rule,
+      reason: sc.reason,
+      checks: sc.checks,
+      status: 'evaluating',
+      outcome: null,
+    }
+    this._patch({ events: [...this._snap.events, evaluatingEvent] })
+
+    // Run gateway
+    const toolCall: ToolCall = {
+      tool: sc.call.tool,
+      args: sc.call.args as Record<string, unknown>,
+      provenance: {
+        label: sc.call.source.label,
+        untrusted: sc.call.source.kind === 'untrusted',
+      },
+    }
+    const evalCtx: EvalContext = {
+      user: { id: gwUser.id, name: gwUser.name, role: gwUser.role },
+      grant: gwGrant,
+      agentMode: 'simulated',
+    }
+    const result = await this._gw.submit(toolCall, evalCtx, { eventId })
+
+    // Update event status
+    const eventStatus = this._decisionToEventStatus(result.decision)
+    this._patch({
+      events: this._snap.events.map((e) =>
+        e.id === eventId ? { ...e, status: eventStatus } : e
+      ),
+    })
+
+    // Finalize
+    await this._finalize(sc, eventId, result, gwGrant)
+  }
+
+  // ── resolveApproval ────────────────────────────────────────────────────────
+
+  resolveApproval(id: string, action: 'approve' | 'deny', note: string): boolean {
+    const ap = this._snap.approvals.find((a) => a.id === id)
+    const cleanNote = note.trim()
+    if (!ap || ap.status !== 'pending') return false
+    if (action === 'deny' && !cleanNote) return false
+
+    // fire async internally
+    void this._resolveApprovalAsync(id, action, cleanNote, ap)
+    return true
+  }
+
+  private async _resolveApprovalAsync(
+    id: string,
+    action: 'approve' | 'deny',
+    cleanNote: string,
+    ap: ApprovalRequest,
+  ): Promise<void> {
+    const scenarioId = this._approvalToScenario.get(id)
+    const sc = SCENARIOS.find((s) => s.id === scenarioId)
+    if (!sc) return
+
+    const gwReviewer = getUser(ap.reviewer.id)
+    if (!gwReviewer) return
+
+    const resolveResult = await this._gw.resolveApproval({
+      approvalId: id,
+      reviewer: gwReviewer,
+      outcome: action === 'approve' ? 'approve' : 'deny',
+      note: cleanNote,
+    })
+    if (!resolveResult.ok) return
+
+    const approve = action === 'approve'
+    const outcome = this._buildResolvedOutcome(sc, action, cleanNote, ap, resolveResult)
+
+    // Map audit entry
+    const auditEntries = this._snap.auditEntries
+    if (resolveResult.auditEntry) {
+      const uiEntry = this._mapAuditEntry(
+        resolveResult.auditEntry,
+        sc,
+        action,
+        cleanNote,
+        ap.reviewer,
+      )
+      this._patch({ auditEntries: [...auditEntries, uiEntry] })
+    }
+
+    // Update approval
+    const approvals = this._snap.approvals.map((a) =>
+      a.id === id
+        ? { ...a, status: (approve ? 'approved' : 'denied') as 'approved' | 'denied', note: cleanNote || null, outcome }
+        : a,
+    )
+
+    // Update event
+    const events = this._snap.events.map((e) =>
+      e.id === ap.eventId
+        ? { ...e, status: (approve ? 'approved' : 'denied') as ActionEvent['status'], outcome }
+        : e,
+    )
+
+    const liveMessage = approve
+      ? `Request approved: ${ap.tool} was executed.`
+      : `Request denied: ${ap.tool} was not executed.`
+
+    this._patch({ approvals, events, liveMessage, selectedEventId: ap.eventId })
+  }
+
+  // ── verifyChain ────────────────────────────────────────────────────────────
+
+  verifyChain(): void {
+    void this._verifyChainAsync()
+  }
+
+  private async _verifyChainAsync(): Promise<void> {
+    const entries = this._gw.audit.getAll()
+    const result = await gwVerifyChain(entries)
+    this._patch({ chainOk: result.ok, chainBrokenAt: result.brokenAt })
+  }
+
+  // ── tamperDemo ─────────────────────────────────────────────────────────────
+
+  tamperDemo(): void {
+    doTamper(this._gw.audit)
+    // Update UI entries to show the tampered text
+    const gwEntries = this._gw.audit.getAll()
+    const uiEntries = this._snap.auditEntries.map((uiE) => {
+      const gwe = gwEntries.find((g) => g.index === uiE.seq)
+      if (!gwe) return uiE
+      return { ...uiE, hash: gwe.hash.substring(0, 8), reason: gwe.reason }
+    })
+    void gwVerifyChain(gwEntries).then((result) => {
+      this._patch({
+        auditEntries: uiEntries,
+        chainOk: result.ok,
+        chainBrokenAt: result.brokenAt,
+      })
+    })
+  }
+
+  // ── reset ──────────────────────────────────────────────────────────────────
+
+  reset(): void {
+    this._clearTimers()
+    this._clearCountdown()
+    this._gw.reset()
+    resetTamper(this._gw.audit)
+    this._eventSeq = 0
+    this._approvalToScenario.clear()
+    this._currentGrant = null
+    this._snap = {
+      currentTask: null,
+      currentUser: USERS.rohan,
+      events: [],
+      approvals: [],
+      auditEntries: [],
+      chainOk: true,
+      chainBrokenAt: null,
+      runningId: null,
+      doneIds: [],
+      selectedEventId: null,
+      activity: null,
+      toast: null,
+      liveMessage: '',
+    }
+    this._notify()
+  }
+
+  private _scheduleTimeout(fn: () => void, ms: number): void {
+    const t = setTimeout(() => {
+      this._timers = this._timers.filter((timer) => timer !== t)
+      fn()
+    }, ms)
+    this._timers.push(t)
+  }
+
+  private _clearTimers(): void {
+    for (const t of this._timers) {
+      clearTimeout(t)
+    }
+    this._timers = []
+    if (this._toastTimeout != null) {
+      clearTimeout(this._toastTimeout)
+      this._toastTimeout = null
+    }
+  }
+
+  // ── Internal: runScenario with setTimeout ──────────────────────────────────
+
+  private _runScenarioInternal(sc: (typeof SCENARIOS)[0]): void {
+    const id = sc.id
+    const [d0, d1, d2, d3] = this._delays
+
+    // Issue grant
+    const userId = sc.id === 's5' ? 'u-priya' : 'u-rohan'
+    const allowTools: ToolName[] = ['invoice.lookup', 'refund.issue']
+    const gwGrant = issueGrant({
+      taskId: sc.taskId,
+      userId,
+      allowTools,
+      allowResources: ['C-204'],
+    })
+    this._currentGrant = gwGrant
+
+    // Build UI task grant immediately (with live countdown)
+    const uiGrant = this._buildUIGrant(sc, gwGrant)
+    this._clearCountdown()
+    this._startCountdown(gwGrant.expiresAt, uiGrant)
+
+    const gwUser = getUser(gwGrant.userId)!
+
+    // t=0: set user, task, activity stage 1, mark running
+    const eventId = `EVT-${String(++this._eventSeq).padStart(3, '0')}`
+    this._patch({
+      currentUser: sc.user,
+      currentTask: uiGrant,
+      activity: { scenarioId: id, stage: 1 },
+      runningId: id,
+    })
+
+    // Start agent (fire-and-forget — it emits events at 0ms and 0ms)
+    void this._agent.run(sc.id, sc.request, (ev) => {
+      if (ev.kind === 'agent_message') {
+        // handled by t=d0 timer
+      }
+    })
+
+    // t=d0: activity stage 2
+    this._scheduleTimeout(() => {
+      this._patch({ activity: { scenarioId: id, stage: 2 } })
+    }, d0)
+
+    // t=d0+d1: add evaluating event
+    this._scheduleTimeout(() => {
+      const evaluatingEvent: ActionEvent = {
+        id: eventId,
+        scenarioId: id,
+        scenarioNumber: sc.number,
+        time: sc.time,
+        requestedBy: sc.user,
+        taskId: sc.taskId,
+        call: sc.call,
+        decision: sc.decision,
+        rule: sc.rule,
+        reason: sc.reason,
+        checks: sc.checks,
+        status: 'evaluating',
+        outcome: null,
+      }
+      this._patch({ events: [...this._snap.events, evaluatingEvent] })
+
+      // Run the gateway submit async
+      const toolCall: ToolCall = {
+        tool: sc.call.tool,
+        args: sc.call.args as Record<string, unknown>,
+        provenance: {
+          label: sc.call.source.label,
+          untrusted: sc.call.source.kind === 'untrusted',
+        },
+      }
+      const evalCtx: EvalContext = {
+        user: { id: gwUser.id, name: gwUser.name, role: gwUser.role },
+        grant: gwGrant,
+        agentMode: 'simulated',
+      }
+      void this._gw.submit(toolCall, evalCtx, { eventId }).then((result) => {
+        // t≈d0+d1+d2: update event status
+        this._scheduleTimeout(() => {
+          const eventStatus = this._decisionToEventStatus(result.decision)
+          this._patch({
+            events: this._snap.events.map((e) =>
+              e.id === eventId ? { ...e, status: eventStatus } : e
+            ),
+          })
+
+          // t≈d0+d1+d2+d3: finalize
+          this._scheduleTimeout(() => {
+            void this._finalize(sc, eventId, result, gwGrant)
+          }, d3)
+        }, d2)
+      })
+    }, d0 + d1)
+  }
+
+  // ── Internal: finalize ─────────────────────────────────────────────────────
+
+  private async _finalize(
+    sc: (typeof SCENARIOS)[0],
+    eventId: string,
+    result: Awaited<ReturnType<Gateway['submit']>>,
+    gwGrant: ReturnType<typeof issueGrant>,
+  ): Promise<void> {
+    const decision = result.decision
+
+    let outcome: string | null = null
+    let approvalId: string | undefined
+
+    if (decision === 'needs_approval') {
+      approvalId = result.approvalId
+
+      // Build pending outcome text
+      const requiredReviewerRole = sc.user.role === 'Support Agent' ? 'Support Lead' : 'Ops Manager'
+      const reviewerGwUser = getUserByRole(requiredReviewerRole as Role)
+      outcome = reviewerGwUser
+        ? `Waiting for approval from ${reviewerGwUser.name} (${reviewerGwUser.role}).`
+        : 'Waiting for approval.'
+
+      // Build UI approval request
+      const uiReviewer = this._gwRoleToUIUser(requiredReviewerRole as Role)
+
+      const uiApproval: ApprovalRequest = {
+        id: approvalId!,
+        eventId,
+        scenarioId: sc.id,
+        title: sc.approvalSentence ?? sc.call.summary,
+        requester: sc.user,
+        reviewer: uiReviewer,
+        taskId: sc.taskId,
+        tool: sc.call.tool,
+        args: sc.call.args as Record<string, ArgValue>,
+        reason: sc.reason,
+        requestedAt: sc.time,
+        status: 'pending',
+        note: null,
+        outcome,
+      }
+
+      this._approvalToScenario.set(approvalId!, sc.id)
+
+      const approvals = [...this._snap.approvals, uiApproval]
+      this._patch({ approvals })
+
+      this._showToast({
+        message: 'Approval requested',
+        linkLabel: 'Review',
+        href: `#/approvals/${approvalId}`,
+      })
+    } else {
+      outcome = this._buildOutcome(sc, result)
+    }
+
+    const uiChecks: Check[] = result.checks.map((c) => ({
+      name: CHECK_NAMES[c.id] || c.id,
+      status: c.status,
+      text: c.note,
+    }))
+
+    // Update events with outcome and evaluated checks
+    const events = this._snap.events.map((e) =>
+      e.id === eventId ? { ...e, outcome, approvalId, checks: uiChecks } : e
+    )
+
+    // Map audit entry to UI
+    const auditEntries = this._snap.auditEntries
+    let newAuditEntries = auditEntries
+    if (result.auditEntry) {
+      const uiEntry = this._mapAuditEntry(result.auditEntry, sc, undefined, undefined, undefined)
+      newAuditEntries = [...auditEntries, uiEntry]
+    }
+
+    const tool = sc.call.tool
+    const liveMessage =
+      decision === 'allowed'
+        ? `Action allowed: ${tool}.`
+        : decision === 'blocked'
+          ? `Action blocked: ${tool}. The tool was not called.`
+          : `Approval needed: ${tool}. Waiting for review.`
+
+    this._patch({
+      events,
+      auditEntries: newAuditEntries,
+      selectedEventId: eventId,
+      doneIds: this._snap.doneIds.includes(sc.id)
+        ? this._snap.doneIds
+        : [...this._snap.doneIds, sc.id],
+      runningId: null,
+      liveMessage,
+    })
+  }
+
+  // ── Internal: build UI types ───────────────────────────────────────────────
+
+  private _buildUIGrant(
+    sc: (typeof SCENARIOS)[0],
+    gwGrant: ReturnType<typeof issueGrant>,
+  ): TaskGrant {
+    return {
+      taskId: sc.taskId,
+      title: sc.taskTitle,
+      requestedBy: sc.user,
+      customer: `${RECORDS.customer.id} · ${RECORDS.customer.name}`,
+      tools: [...gwGrant.allowTools] as ToolName[],
+      resource: `customer ${RECORDS.customer.id}`,
+      expires: GRANT_EXPIRES,
+      timeLeft: formatTimeLeft(gwGrant.expiresAt),
+    }
+  }
+
+  private _startCountdown(expiresAt: Date, baseGrant: TaskGrant): void {
+    this._countdownInterval = setInterval(() => {
+      if (!this._snap.currentTask) {
+        this._clearCountdown()
+        return
+      }
+      const timeLeft = formatTimeLeft(expiresAt)
+      this._patch({ currentTask: { ...this._snap.currentTask, timeLeft } })
+    }, 1000)
+  }
+
+  private _clearCountdown(): void {
+    if (this._countdownInterval != null) {
+      clearInterval(this._countdownInterval)
+      this._countdownInterval = null
+    }
+  }
+
+  private _mapAuditEntry(
+    gae: GatewayAuditEntry,
+    sc: (typeof SCENARIOS)[0],
+    action?: 'approve' | 'deny',
+    note?: string,
+    reviewerUser?: User,
+  ): AuditEntry {
+    const result = this._buildResultText(gae, sc, action, note, reviewerUser ?? undefined)
+    return {
+      seq: gae.index,
+      date: DEMO_DATE,
+      time: sc.resolvedTime && action ? sc.resolvedTime : sc.time,
+      requestedBy: gae.user.name,
+      role: gae.user.role,
+      taskId: gae.taskId,
+      tool: gae.tool,
+      args: gae.args as Record<string, ArgValue>,
+      decision: gae.decision,
+      rule: gae.ruleId,
+      reason: gae.reason,
+      reviewer: gae.reviewer?.name ?? null,
+      result,
+      hash: gae.hash.substring(0, 8),
+      prevHash: gae.prevHash.substring(0, 8),
+      eventId: gae.eventId,
+    }
+  }
+
+  private _buildResultText(
+    gae: GatewayAuditEntry,
+    sc: (typeof SCENARIOS)[0],
+    action?: 'approve' | 'deny',
+    note?: string,
+    reviewerUser?: User,
+  ): string {
+    const decision = gae.decision
+    const tool = gae.tool
+
+    if (action === 'deny' && reviewerUser) {
+      const cleanNote = (note ?? '').replace(/\.+$/, '')
+      return `Not executed. Denied by ${reviewerUser.name}: ${cleanNote}.`
+    }
+
+    if (action === 'approve' && reviewerUser) {
+      if (tool === 'refund.issue') {
+        const exResult = gae.execution.result as Record<string, unknown> | undefined
+        const refundId = (exResult?.refund_id as string) ?? ''
+        const amount = (gae.args['amount'] as number) ?? 0
+        return `Executed after approval by ${reviewerUser.name}. Refund ${refundId} for ₹${amount.toLocaleString('en-IN')} created in the mock payment system.`
+      }
+      if (tool === 'customer.export') {
+        return `Executed after approval by ${reviewerUser.name}. Exported 1,240 synthetic customer records from the mock customer system.`
+      }
+    }
+
+    if (decision === 'blocked') {
+      return 'Not executed. The tool was never called and no data left the system.'
+    }
+
+    if (decision === 'needs_approval') {
+      const requiredReviewerRole = sc.user.role === 'Support Agent' ? 'Support Lead' : 'Ops Manager'
+      const rwUser = getUserByRole(requiredReviewerRole as Role)
+      return rwUser
+        ? `Waiting for approval from ${rwUser.name} (${rwUser.role}).`
+        : 'Waiting for approval.'
+    }
+
+    if (decision === 'allowed') {
+      if (tool === 'invoice.lookup') {
+        return 'Executed. Returned invoice INV-1042: ₹73,000, Paid, 3 line items. The add-on appears twice.'
+      }
+      if (tool === 'refund.issue') {
+        const exResult = gae.execution.result as Record<string, unknown> | undefined
+        const refundId = (exResult?.refund_id as string) ?? ''
+        const amount = (gae.args['amount'] as number) ?? 0
+        return `Executed. Refund ${refundId} for ₹${amount.toLocaleString('en-IN')} created in the mock payment system.`
+      }
+    }
+
+    return ''
+  }
+
+  private _buildOutcome(
+    sc: (typeof SCENARIOS)[0],
+    result: Awaited<ReturnType<Gateway['submit']>>,
+  ): string {
+    if (result.decision === 'blocked') {
+      return 'Not executed. The tool was never called and no data left the system.'
+    }
+    if (result.decision === 'allowed') {
+      const tool = sc.call.tool
+      if (tool === 'invoice.lookup') {
+        return 'Executed. Returned invoice INV-1042: ₹73,000, Paid, 3 line items. The add-on appears twice.'
+      }
+      if (tool === 'refund.issue') {
+        const exResult = result.execution.result as Record<string, unknown> | undefined
+        const refundId = (exResult?.refund_id as string) ?? ''
+        const amount = (sc.call.args['amount'] as number) ?? 0
+        return `Executed. Refund ${refundId} for ₹${amount.toLocaleString('en-IN')} created in the mock payment system.`
+      }
+    }
+    return ''
+  }
+
+  private _buildResolvedOutcome(
+    sc: (typeof SCENARIOS)[0],
+    action: 'approve' | 'deny',
+    note: string,
+    ap: ApprovalRequest,
+    resolveResult: Awaited<ReturnType<Gateway['resolveApproval']>>,
+  ): string {
+    if (!resolveResult.ok) return ''
+    const approve = action === 'approve'
+    if (!approve) {
+      const cleanNote = note.replace(/\.+$/, '')
+      return `Not executed. Denied by ${ap.reviewer.name}: ${cleanNote}.`
+    }
+    const tool = ap.tool
+    if (tool === 'refund.issue') {
+      const exResult = resolveResult.executionResult?.data as Record<string, unknown> | undefined
+      const refundId = (exResult?.refund_id as string) ?? ''
+      const amount = (ap.args['amount'] as number) ?? 0
+      return `Executed after approval by ${ap.reviewer.name}. Refund ${refundId} for ₹${amount.toLocaleString('en-IN')} created in the mock payment system.`
+    }
+    if (tool === 'customer.export') {
+      return `Executed after approval by ${ap.reviewer.name}. Exported 1,240 synthetic customer records from the mock customer system.`
+    }
+    return ''
+  }
+
+  private _decisionToEventStatus(
+    decision: 'allowed' | 'needs_approval' | 'blocked',
+  ): ActionEvent['status'] {
+    if (decision === 'allowed') return 'allowed'
+    if (decision === 'blocked') return 'blocked'
+    return 'pending'
+  }
+
+  private _gwRoleToUIUser(role: Role): User {
+    if (role === 'Support Lead') return USERS.priya
+    if (role === 'Ops Manager') return USERS.dev
+    if (role === 'Finance Admin') return USERS.anita
+    return USERS.rohan
+  }
+
+  // ── Internal: toast ────────────────────────────────────────────────────────
+
+  private _showToast(t: Omit<Toast, 'id'>): void {
+    if (this._toastTimeout != null) {
+      clearTimeout(this._toastTimeout)
+    }
+    const toast: Toast = { ...t, id: ++_toastSeq }
+    this._patch({ toast })
+    this._toastTimeout = setTimeout(() => {
+      this._patch({ toast: null })
+    }, 4000)
+  }
+
+  // ── Internal: state management ─────────────────────────────────────────────
+
+  private _patch(partial: Partial<ControllerSnapshot>): void {
+    this._snap = { ...this._snap, ...partial }
+    this._notify()
+  }
+
+  private _notify(): void {
+    for (const fn of this._subscribers) {
+      fn(this._snap)
+    }
+  }
+}

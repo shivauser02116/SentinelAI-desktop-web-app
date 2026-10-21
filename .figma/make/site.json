@@ -1,0 +1,10 @@
+{
+  "description": "Streamline AI agent actions in workplace tools with role-based decision control, ensuring compliance and transparency through an audit log for support teams.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
