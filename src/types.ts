@@ -66,6 +66,7 @@ export interface Scenario {
   deniedText?: string
   approvalSentence?: string
   resolvedTime?: string
+  grant?: { userId: string; allowTools: ToolName[]; allowResources: string[]; resourceLabel?: string }
 }
 
 export interface ActionEvent {

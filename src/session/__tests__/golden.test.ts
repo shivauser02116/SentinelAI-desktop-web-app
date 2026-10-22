@@ -44,6 +44,12 @@ describe('golden scenario characterization', () => {
     ctrl.resolveApproval(s5Approval!.id, 'deny', 'Full export not permitted')
     await new Promise((r) => setTimeout(r, 25))
 
+    // S6
+    await ctrl.runScenarioSync('s6')
+
+    // S7
+    await ctrl.runScenarioSync('s7')
+
     const snap = ctrl.getSnapshot()
 
     // Build normalized snapshot of all UI-visible fields

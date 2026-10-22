@@ -13,7 +13,7 @@ export function TaskGrantCard() {
         rows={[
           ['Task ID', t.taskId, true],
           ['Requested by', `${t.requestedBy.name}, ${t.requestedBy.role}`],
-          ['Customer', t.customer],
+          ...(t.customer ? [['Customer', t.customer] as [string, string]] : []),
         ]}
       />
       <div className="mt-4 border-t border-border pt-3">

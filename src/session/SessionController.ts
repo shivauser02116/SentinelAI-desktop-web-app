@@ -5,7 +5,7 @@
  * a subscribe() pattern. All UI timing is driven by setTimeout so React
  * never blocks on async work.
  */
-import { Gateway } from '../gateway/gateway'
+import { Gateway, getRequiredReviewerRole } from '../gateway/gateway'
 import { issueGrant } from '../gateway/grants'
 import { getUserByRole, getUser } from '../gateway/mockDb'
 import { verifyChain as gwVerifyChain, type GatewayAuditEntry } from '../gateway/audit'
@@ -63,6 +63,7 @@ const CHECK_NAMES: Record<string, string> = {
   role_access: 'Role access',
   task_scope: 'Task scope',
   arg_limits: 'Argument limits',
+  input_source: 'Input source',
 }
 
 function formatTimeLeft(expiresAt: Date): string {
@@ -71,6 +72,24 @@ function formatTimeLeft(expiresAt: Date): string {
   const m = Math.floor(totalSec / 60)
   const s = totalSec % 60
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')} left`
+}
+
+function grantFor(sc: (typeof SCENARIOS)[0]) {
+  if (sc.grant) {
+    return issueGrant({
+      taskId: sc.taskId,
+      userId: sc.grant.userId,
+      allowTools: sc.grant.allowTools,
+      allowResources: sc.grant.allowResources,
+    })
+  }
+  const userId = sc.id === 's5' ? 'u-priya' : 'u-rohan'
+  return issueGrant({
+    taskId: sc.taskId,
+    userId,
+    allowTools: ['invoice.lookup', 'refund.issue'],
+    allowResources: ['C-204'],
+  })
 }
 
 let _toastSeq = 0
@@ -151,18 +170,7 @@ export class SessionController {
     if (!sc) return
 
     // Issue grant
-    const userId =
-      sc.id === 's5' ? 'u-priya' : 'u-rohan'
-    const allowTools: ToolName[] =
-      sc.id === 's5'
-        ? ['invoice.lookup', 'refund.issue']
-        : ['invoice.lookup', 'refund.issue']
-    const gwGrant = issueGrant({
-      taskId: sc.taskId,
-      userId,
-      allowTools,
-      allowResources: ['C-204'],
-    })
+    const gwGrant = grantFor(sc)
     this._currentGrant = gwGrant
 
     // Build UI task grant
@@ -384,14 +392,7 @@ export class SessionController {
     const [d0, d1, d2, d3] = this._delays
 
     // Issue grant
-    const userId = sc.id === 's5' ? 'u-priya' : 'u-rohan'
-    const allowTools: ToolName[] = ['invoice.lookup', 'refund.issue']
-    const gwGrant = issueGrant({
-      taskId: sc.taskId,
-      userId,
-      allowTools,
-      allowResources: ['C-204'],
-    })
+    const gwGrant = grantFor(sc)
     this._currentGrant = gwGrant
 
     // Build UI task grant immediately (with live countdown)
@@ -491,7 +492,7 @@ export class SessionController {
       approvalId = result.approvalId
 
       // Build pending outcome text
-      const requiredReviewerRole = sc.user.role === 'Support Agent' ? 'Support Lead' : 'Ops Manager'
+      const requiredReviewerRole = getRequiredReviewerRole(sc.user.role as Role) ?? 'Ops Manager'
       const reviewerGwUser = getUserByRole(requiredReviewerRole as Role)
       outcome = reviewerGwUser
         ? `Waiting for approval from ${reviewerGwUser.name} (${reviewerGwUser.role}).`
@@ -539,7 +540,17 @@ export class SessionController {
 
     // Update events with outcome and evaluated checks
     const events = this._snap.events.map((e) =>
-      e.id === eventId ? { ...e, outcome, approvalId, checks: uiChecks } : e
+      e.id === eventId
+        ? {
+            ...e,
+            decision: result.decision,
+            rule: result.ruleId,
+            reason: result.reason,
+            outcome,
+            approvalId,
+            checks: uiChecks,
+          }
+        : e
     )
 
     // Map audit entry to UI
@@ -580,9 +591,9 @@ export class SessionController {
       taskId: sc.taskId,
       title: sc.taskTitle,
       requestedBy: sc.user,
-      customer: `${RECORDS.customer.id} · ${RECORDS.customer.name}`,
+      customer: sc.grant?.resourceLabel ? '' : `${RECORDS.customer.id} · ${RECORDS.customer.name}`,
       tools: [...gwGrant.allowTools] as ToolName[],
-      resource: `customer ${RECORDS.customer.id}`,
+      resource: sc.grant?.resourceLabel ?? `customer ${RECORDS.customer.id}`,
       expires: GRANT_EXPIRES,
       timeLeft: formatTimeLeft(gwGrant.expiresAt),
     }
@@ -659,6 +670,9 @@ export class SessionController {
       if (tool === 'customer.export') {
         return `Executed after approval by ${reviewerUser.name}. Exported 1,240 synthetic customer records from the mock customer system.`
       }
+      if (tool === 'payroll.export') {
+        return `Executed after approval by ${reviewerUser.name}. Exported 86 synthetic payroll rows from the mock payroll system.`
+      }
     }
 
     if (decision === 'blocked') {
@@ -666,7 +680,7 @@ export class SessionController {
     }
 
     if (decision === 'needs_approval') {
-      const requiredReviewerRole = sc.user.role === 'Support Agent' ? 'Support Lead' : 'Ops Manager'
+      const requiredReviewerRole = getRequiredReviewerRole(sc.user.role as Role) ?? 'Ops Manager'
       const rwUser = getUserByRole(requiredReviewerRole as Role)
       return rwUser
         ? `Waiting for approval from ${rwUser.name} (${rwUser.role}).`
@@ -732,6 +746,9 @@ export class SessionController {
     }
     if (tool === 'customer.export') {
       return `Executed after approval by ${ap.reviewer.name}. Exported 1,240 synthetic customer records from the mock customer system.`
+    }
+    if (tool === 'payroll.export') {
+      return `Executed after approval by ${ap.reviewer.name}. Exported 86 synthetic payroll rows from the mock payroll system.`
     }
     return ''
   }
