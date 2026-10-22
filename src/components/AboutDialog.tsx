@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react'
 import { Button, SectionLabel } from './ui'
 
 const simulated = [
-  'The AI agent is a script. It proposes the same tool calls on every run.',
+  'The AI agent is a script by default. Live LLM mode (optional, needs your own API key and network) lets a real model propose the calls.',
   'The business tools (invoice lookup, refund, customer export, payroll export) are mocks. No real payment or HR system is touched.',
   'All customers, employees, invoices and amounts are synthetic.',
   'Roles, limits and reviewers are prototype policy settings.',

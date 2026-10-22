@@ -3,7 +3,7 @@ import { ScenarioItem } from './ScenarioItem'
 import { SectionLabel } from './ui'
 
 export function ScenarioList({ compact = false }: { compact?: boolean }) {
-  const { scenarios, runningId, doneIds, runScenario, events, selectedEventId, activity } = useSession()
+  const { scenarios, runningId, doneIds, runScenario, runLive, mode, events, selectedEventId, activity } = useSession()
   const selectedScenario =
     runningId ?? events.find((e) => e.id === selectedEventId)?.scenarioId ?? activity?.scenarioId ?? null
   return (
@@ -21,7 +21,7 @@ export function ScenarioList({ compact = false }: { compact?: boolean }) {
             done={doneIds.includes(s.id)}
             selected={selectedScenario === s.id}
             disabled={runningId !== null}
-            onRun={() => runScenario(s.id)}
+            onRun={() => mode === 'live' ? void runLive(s.id) : runScenario(s.id)}
           />
         ))}
       </ul>

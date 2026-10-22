@@ -66,7 +66,7 @@ export function EventDetailPanel({ event }: { event: ActionEvent | null }) {
           <h2 className="font-mono text-base font-semibold">{event.call.tool}</h2>
           {!evaluating && <DecisionPill decision={event.decision} />}
         </div>
-        <p className="mt-1 text-13 text-text-muted">Proposed by simulated agent · {event.time}</p>
+        <p className="mt-1 text-13 text-text-muted">Proposed by {event.agentMode === 'live' ? 'live LLM' : 'simulated agent'} · {event.time}</p>
       </header>
 
       <Section title="Attempted">
