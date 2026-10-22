@@ -16,6 +16,12 @@ const steps: { n: number; title: string; q: string; fails: { text?: string; d: D
       { text: 'Over the invoice total:', d: 'blocked' },
     ],
   },
+  {
+    n: 4,
+    title: 'Input source',
+    q: 'Proposed after reading untrusted text?',
+    fails: [{ d: 'needs_approval' }],
+  },
 ]
 
 function H({ children }: { children: string }) {

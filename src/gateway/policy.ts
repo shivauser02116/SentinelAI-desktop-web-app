@@ -24,6 +24,8 @@ const ROLE_TOOLS: Record<Role, ToolName[]> = {
   'Ops Manager': [],
 }
 
+export const COMPANY_DOMAIN = '@sentinel-demo.example'
+
 function roleCanUseTool(role: Role, tool: ToolName): boolean {
   return ROLE_TOOLS[role].includes(tool)
 }
@@ -122,6 +124,7 @@ export function evaluate(call: ToolCall, ctx: EvalContext, now: Date): PolicyDec
         check('role_access', 'failed', `${roleLabel} has no access to ${tool}.`),
         check('task_scope', 'not_evaluated', NOT_EVALUATED),
         check('arg_limits', 'not_evaluated', NOT_EVALUATED),
+        check('input_source', 'not_evaluated', NOT_EVALUATED),
       ],
     }
   }
@@ -138,6 +141,7 @@ export function evaluate(call: ToolCall, ctx: EvalContext, now: Date): PolicyDec
         check('role_access', 'passed', `${roleLabel} may use ${tool}.`),
         check('task_scope', 'failed', `Grant expired at ${expiry}.`),
         check('arg_limits', 'not_evaluated', NOT_EVALUATED),
+        check('input_source', 'not_evaluated', NOT_EVALUATED),
       ],
     }
   }
@@ -169,6 +173,7 @@ export function evaluate(call: ToolCall, ctx: EvalContext, now: Date): PolicyDec
         check('role_access', 'passed', `${roleLabel} may use ${tool}.`),
         check('task_scope', 'failed', scopeNote),
         check('arg_limits', 'not_evaluated', NOT_EVALUATED),
+        check('input_source', 'not_evaluated', NOT_EVALUATED),
       ],
     }
   }
@@ -190,6 +195,7 @@ export function evaluate(call: ToolCall, ctx: EvalContext, now: Date): PolicyDec
           check('role_access', 'passed', `${roleLabel} may use ${tool}.`),
           check('task_scope', 'passed', `Inside task grant: ${tool} on ${resource}.`),
           check('arg_limits', 'failed', `Refund of ${fmtINR(amount)} exceeds the invoice total of ${fmtINR(invoiceTotal)}.`),
+          check('input_source', 'not_evaluated', NOT_EVALUATED),
         ],
       }
     }
@@ -208,10 +214,58 @@ export function evaluate(call: ToolCall, ctx: EvalContext, now: Date): PolicyDec
             'failed',
             `${fmtINR(amount)} is above the ${fmtINR(grant.limits.requireApprovalAbove)} limit for refunds without approval. Invoice total is ${fmtINR(invoiceTotal)}.`,
           ),
+          check('input_source', 'not_evaluated', NOT_EVALUATED),
         ],
       }
     }
   }
+
+  // Export destination rule for payroll.export and customer.export
+  if (tool === 'payroll.export' || tool === 'customer.export') {
+    const destination = call.args['destination'] as string | undefined
+    const isInternal =
+      !destination ||
+      destination === 'download' ||
+      (typeof destination === 'string' && destination.endsWith(COMPANY_DOMAIN))
+    if (!isInternal) {
+      return {
+        decision: 'needs_approval',
+        ruleId: 'args.export_destination',
+        reason: `Export destination ${destination} is outside the company domain.`,
+        checks: [
+          check('role_access', 'passed', `${roleLabel} may use ${tool}.`),
+          check('task_scope', 'passed', `Inside task grant: ${tool} on ${resource}.`),
+          check('arg_limits', 'failed', `Destination ${destination} is outside the company domain (${COMPANY_DOMAIN}).`),
+          check('input_source', 'not_evaluated', NOT_EVALUATED),
+        ],
+      }
+    }
+  }
+
+  let limitsPassedNote = 'No limits apply to these arguments.'
+  if (tool === 'refund.issue') {
+    const amount = call.args['amount'] as number
+    limitsPassedNote = `${fmtINR(amount)} is within the ${fmtINR(grant.limits.requireApprovalAbove)} limit for refunds without approval.`
+  }
+
+  // ── Check 4: Input source ────────────────────────────────────────────────
+  if (provenance.untrusted && tool !== 'invoice.lookup') {
+    return {
+      decision: 'needs_approval',
+      ruleId: 'source.untrusted_input',
+      reason: 'This call was proposed after reading untrusted text. A reviewer must confirm it.',
+      checks: [
+        check('role_access', 'passed', `${roleLabel} may use ${tool}.`),
+        check('task_scope', 'passed', `Inside task grant: ${tool} on ${resource}.`),
+        check('arg_limits', 'passed', limitsPassedNote),
+        check('input_source', 'failed', `Proposed after reading untrusted text (${provenance.label}).`),
+      ],
+    }
+  }
+
+  const inputSourceNote = provenance.untrusted
+    ? 'Read-only call. Untrusted input is allowed here.'
+    : `Proposed from ${provenance.label}.`
 
   // ── Allowed ───────────────────────────────────────────────────────────────
   return {
@@ -221,7 +275,8 @@ export function evaluate(call: ToolCall, ctx: EvalContext, now: Date): PolicyDec
     checks: [
       check('role_access', 'passed', `${roleLabel} may use ${tool}.`),
       check('task_scope', 'passed', `Inside task grant: ${tool} on ${resource}.`),
-      check('arg_limits', 'passed', 'No limits apply to these arguments.'),
+      check('arg_limits', 'passed', limitsPassedNote),
+      check('input_source', 'passed', inputSourceNote),
     ],
   }
 }

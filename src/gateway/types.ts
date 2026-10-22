@@ -22,7 +22,7 @@ export interface ToolCall {
   provenance: Provenance
 }
 
-export type CheckId = 'role_access' | 'task_scope' | 'arg_limits'
+export type CheckId = 'role_access' | 'task_scope' | 'arg_limits' | 'input_source'
 
 export interface CheckResult {
   id: CheckId

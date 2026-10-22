@@ -36,6 +36,11 @@ export interface SubmitOptions {
 const REVIEWER_ROLE: Partial<Record<Role, Role>> = {
   'Support Agent': 'Support Lead',
   'Support Lead': 'Ops Manager',
+  'Finance Admin': 'Ops Manager',
+}
+
+export function getRequiredReviewerRole(role: Role): Role | undefined {
+  return REVIEWER_ROLE[role]
 }
 
 // Deterministic approval ID counter

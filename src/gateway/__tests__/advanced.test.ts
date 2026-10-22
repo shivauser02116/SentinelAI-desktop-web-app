@@ -31,14 +31,14 @@ describe('Test 11 — Determinism', () => {
     }
 
     const firstRun = await runAll()
-    expect(firstRun).toHaveLength(5)
+    expect(firstRun).toHaveLength(SCENARIOS.length)
 
     ctrl.reset()
     expect(ctrl.getSnapshot().events).toHaveLength(0)
     expect(ctrl.getSnapshot().auditEntries).toHaveLength(0)
 
     const secondRun = await runAll()
-    expect(secondRun).toHaveLength(5)
+    expect(secondRun).toHaveLength(SCENARIOS.length)
 
     expect(firstRun).toEqual(secondRun)
   })

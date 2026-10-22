@@ -802,6 +802,18 @@ describe('Test 12 — scenario outputs match baked expected values', () => {
         allowTools: ['invoice.lookup', 'refund.issue'],
         allowResources: ['C-204'],
       }),
+      s6: issueGrant({
+        taskId: 'TASK-1006',
+        userId: USERS.anita.id,
+        allowTools: ['payroll.export'],
+        allowResources: ['payroll'],
+      }),
+      s7: issueGrant({
+        taskId: 'TASK-1007',
+        userId: USERS.rohan.id,
+        allowTools: ['invoice.lookup', 'refund.issue'],
+        allowResources: ['C-204'],
+      }),
     }
 
     const grant = grants[scenarioId]
@@ -847,6 +859,7 @@ describe('Test 12 — scenario outputs match baked expected values', () => {
         role_access: 'Role access',
         task_scope: 'Task scope',
         arg_limits: 'Argument limits',
+        input_source: 'Input source',
       }
 
       for (let i = 0; i < sc.checks.length; i++) {
