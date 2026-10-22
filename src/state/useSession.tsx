@@ -47,6 +47,10 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     selectEvent: (id) => ctrl.selectEvent(id),
     dismissToast: () => ctrl.dismissToast(),
     requestLiveMode: () => ctrl.requestLiveMode(),
+    setMode: (mode) => ctrl.setMode(mode),
+    setLiveConfig: (config) => ctrl.setLiveConfig(config),
+    clearLiveConfig: () => ctrl.clearLiveConfig(),
+    runLive: (input) => ctrl.runLive(input),
   }
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>

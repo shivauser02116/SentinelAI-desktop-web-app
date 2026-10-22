@@ -11,6 +11,8 @@ import { getUserByRole, getUser } from '../gateway/mockDb'
 import { verifyChain as gwVerifyChain, type GatewayAuditEntry } from '../gateway/audit'
 import { tamperDemo as doTamper, reset as resetTamper } from '../demo/tamper'
 import { SimulatedAgent } from '../agent/simulatedAgent'
+import { LiveAgent } from '../agent/liveAgent'
+import { LIVE_MODEL } from '../agent/anthropicClient'
 import { SCENARIOS, USERS, RECORDS, DEMO_DATE, GRANT_EXPIRES } from '../data/scenarios'
 import { deriveAlerts, summarizeInterventions, type Alert, type InterventionsSummary } from '../gateway/alerts'
 import type {
@@ -20,6 +22,7 @@ import type {
   ApprovalRequest,
   AuditEntry,
   Activity,
+  LiveActivity,
   Toast,
   ArgValue,
   ToolName,
@@ -77,6 +80,10 @@ interface ControllerSnapshot {
   liveMessage: string
   alerts: Alert[]
   interventions: InterventionsSummary
+  mode: 'simulated' | 'live'
+  liveReady: boolean
+  liveError: string | null
+  liveActivity: LiveActivity | null
 }
 
 type SubscriberFn = (snap: ControllerSnapshot) => void
@@ -185,6 +192,10 @@ export class SessionController {
     liveMessage: '',
     alerts: [],
     interventions: { blocked: 0, held: 0, approved: 0, denied: 0 },
+    mode: 'simulated',
+    liveReady: false,
+    liveError: null,
+    liveActivity: null,
   }
 
   // Internal tracking maps for approval resolution
@@ -194,6 +205,9 @@ export class SessionController {
   private _toastTimeout: ReturnType<typeof setTimeout> | null = null
   private _timers: ReturnType<typeof setTimeout>[] = []
   private _eventSeq = 0
+  private _liveApiKey: string | null = null
+  private _liveModel: string = LIVE_MODEL
+  private _liveTaskSeq = 0
 
   constructor(opts?: ControllerOptions) {
     this._delays = opts?.delays ?? [600, 600, 600, 600, 400]
@@ -221,6 +235,203 @@ export class SessionController {
 
   requestLiveMode(): void {
     this._showToast({ message: "Live LLM mode isn't configured" })
+  }
+
+  setMode(mode: 'simulated' | 'live'): void {
+    if (mode === 'live' && !this._liveApiKey) {
+      this._showToast({ message: "Live LLM mode isn't configured" })
+      return
+    }
+    this._patch({ mode })
+  }
+
+  setLiveConfig(config: { apiKey: string; model?: string }): void {
+    const key = config.apiKey.trim()
+    this._liveApiKey = key || null
+    if (config.model && config.model.trim()) {
+      this._liveModel = config.model.trim()
+    }
+    this._patch({
+      liveReady: !!this._liveApiKey,
+      liveError: null,
+      mode: this._liveApiKey ? 'live' : 'simulated',
+    })
+  }
+
+  clearLiveConfig(): void {
+    this._liveApiKey = null
+    this._liveModel = LIVE_MODEL
+    this._patch({ liveReady: false, mode: 'simulated' })
+  }
+
+  async runLive(input: string): Promise<void> {
+    if (!this._liveApiKey) {
+      this._showToast({ message: "Live LLM mode isn't configured" })
+      return
+    }
+    if (this._snap.runningId) return
+
+    const sc = SCENARIOS.find((s) => s.id === input)
+
+    let user: User
+    let taskTitle: string
+    let userMessage: string
+    let untrustedBlocks: { label: string; text: string }[] | undefined
+    let gwGrant: ReturnType<typeof issueGrant>
+    let uiGrant: TaskGrant
+
+    if (sc) {
+      user = sc.user
+      taskTitle = sc.taskTitle
+      userMessage = sc.request
+      gwGrant = grantFor(sc)
+      uiGrant = this._buildUIGrant(sc, gwGrant)
+      if (sc.call.source.kind === 'untrusted') {
+        const fullText = (sc.call.source.text ?? '') + (sc.call.source.injected ?? '')
+        untrustedBlocks = [{ label: sc.call.source.label, text: fullText }]
+      }
+    } else {
+      user = this._snap.currentUser
+      taskTitle = 'Live assistant task'
+      userMessage = input
+      const taskId = `TASK-LIVE-${++this._liveTaskSeq}`
+      gwGrant = issueGrant({
+        taskId,
+        userId: user.id === 'u-priya' ? 'u-priya' : user.id === 'u-anita' ? 'u-anita' : 'u-rohan',
+        allowTools: ['invoice.lookup', 'refund.issue'],
+        allowResources: ['C-204'],
+      })
+      uiGrant = {
+        taskId,
+        title: taskTitle,
+        requestedBy: user,
+        customer: `${RECORDS.customer.id} · ${RECORDS.customer.name}`,
+        tools: [...gwGrant.allowTools] as ToolName[],
+        resource: `customer ${RECORDS.customer.id}`,
+        expires: GRANT_EXPIRES,
+        timeLeft: formatTimeLeft(gwGrant.expiresAt),
+      }
+    }
+
+    this._currentGrant = gwGrant
+    this._clearCountdown()
+    this._startCountdown(gwGrant.expiresAt, uiGrant)
+
+    const gwUser = getUser(gwGrant.userId)!
+    const runningId = sc ? sc.id : 'live'
+
+    this._patch({
+      currentUser: user,
+      currentTask: uiGrant,
+      runningId,
+      liveError: null,
+      liveActivity: {
+        request: userMessage,
+        untrusted: sc?.call.source.kind === 'untrusted' ? sc.call.source : undefined,
+        agentLines: [],
+      },
+    })
+
+    const liveAgent = new LiveAgent({
+      apiKey: this._liveApiKey,
+      model: this._liveModel,
+    })
+
+    try {
+      await liveAgent.runTurn({
+        user: { name: user.name, role: user.role },
+        taskTitle,
+        userMessage,
+        untrustedBlocks,
+        emit: (ev) => {
+          if (ev.kind === 'agent_message') {
+            const currentLines = this._snap.liveActivity?.agentLines ?? []
+            this._patch({
+              liveActivity: {
+                ...this._snap.liveActivity!,
+                agentLines: [...currentLines, ev.text],
+              },
+            })
+          }
+        },
+        onToolCall: async (proposedCall, provenance) => {
+          const now = new Date()
+          const nowTime = now.toTimeString().slice(0, 8)
+          const eventId = `EVT-${String(++this._eventSeq).padStart(3, '0')}`
+
+          const callCtx: CallContext = {
+            id: sc ? sc.id : `live-${this._eventSeq}`,
+            number: sc ? sc.number : 0,
+            time: nowTime,
+            user,
+            taskId: gwGrant.taskId,
+            taskTitle,
+            call: {
+              tool: proposedCall.tool,
+              args: proposedCall.args,
+              summary: proposedCall.summary,
+              source: {
+                kind: provenance.untrusted ? 'untrusted' : 'request',
+                label: provenance.label,
+              },
+            },
+          }
+
+          const evaluatingEvent: ActionEvent = {
+            id: eventId,
+            scenarioId: callCtx.id,
+            scenarioNumber: callCtx.number,
+            time: callCtx.time,
+            requestedBy: user,
+            taskId: callCtx.taskId,
+            call: callCtx.call as unknown as ActionEvent['call'],
+            decision: 'allowed',
+            rule: '',
+            reason: '',
+            checks: [],
+            status: 'evaluating',
+            outcome: null,
+            agentMode: 'live',
+          }
+
+          this._patch({ events: [...this._snap.events, evaluatingEvent] })
+
+          const isTest = this._delays.every((d) => d === 0)
+          if (!isTest) {
+            await new Promise((resolve) => setTimeout(resolve, 300))
+          }
+
+          const result = await this._processCall(callCtx, eventId, gwGrant, gwUser, 'live')
+
+          if (result.decision === 'blocked') {
+            return { status: 'blocked', summary: result.reason }
+          }
+          if (result.decision === 'needs_approval') {
+            const reviewerRole = getRequiredReviewerRole(user.role as Role) ?? 'Ops Manager'
+            const reviewer = getUserByRole(reviewerRole as Role)
+            const reviewerName = reviewer ? `${reviewer.name} (${reviewer.role})` : reviewerRole
+            return { status: 'pending', summary: `Waiting for approval from ${reviewerName}.` }
+          }
+          const outcomeText = this._buildOutcome(callCtx, result)
+          return { status: 'executed', summary: outcomeText }
+        },
+      })
+    } catch (err: unknown) {
+      const anthropicErr = err as { kind?: string; message?: string }
+      let message = 'Live LLM execution error.'
+      if (anthropicErr.kind === 'invalid_key') {
+        message = 'Invalid Anthropic API key'
+      } else if (anthropicErr.kind === 'rate_limited') {
+        message = 'Anthropic rate limit reached. Please wait a moment.'
+      } else if (anthropicErr.message) {
+        message = anthropicErr.message
+      }
+
+      this._showToast({ message })
+      this._patch({ liveError: message, mode: 'simulated' })
+    } finally {
+      this._patch({ runningId: null })
+    }
   }
 
   // ── runScenario (fire-and-forget from React) ───────────────────────────────
@@ -273,6 +484,7 @@ export class SessionController {
       checks: sc.checks,
       status: 'evaluating',
       outcome: null,
+      agentMode: 'simulated',
     }
     this._patch({ events: [...this._snap.events, evaluatingEvent] })
 
@@ -402,6 +614,8 @@ export class SessionController {
     this._approvalToCallContext.clear()
     this._previousAlertIds.clear()
     this._currentGrant = null
+    this._liveApiKey = null
+    this._liveModel = LIVE_MODEL
     this._snap = {
       currentTask: null,
       currentUser: USERS.rohan,
@@ -418,6 +632,10 @@ export class SessionController {
       liveMessage: '',
       alerts: [],
       interventions: { blocked: 0, held: 0, approved: 0, denied: 0 },
+      mode: 'simulated',
+      liveReady: false,
+      liveError: null,
+      liveActivity: null,
     }
     this._notify()
   }
@@ -495,6 +713,7 @@ export class SessionController {
         checks: sc.checks,
         status: 'evaluating',
         outcome: null,
+        agentMode: 'simulated',
       }
       this._patch({ events: [...this._snap.events, evaluatingEvent] })
 
@@ -541,12 +760,12 @@ export class SessionController {
       this._scheduleTimeout(() => {
         updateStatus()
         this._scheduleTimeout(() => {
-          void this._finalize(callCtx, eventId, result, grant)
+          void this._finalize(callCtx, eventId, result, grant, agentMode)
         }, delays.dFinalize)
       }, delays.dStatus)
     } else {
       updateStatus()
-      await this._finalize(callCtx, eventId, result, grant)
+      await this._finalize(callCtx, eventId, result, grant, agentMode)
     }
 
     return result
@@ -559,6 +778,7 @@ export class SessionController {
     eventId: string,
     result: Awaited<ReturnType<Gateway['submit']>>,
     gwGrant: ReturnType<typeof issueGrant>,
+    agentMode: 'simulated' | 'live' = 'simulated',
   ): Promise<void> {
     const decision = result.decision
 
@@ -626,6 +846,7 @@ export class SessionController {
             outcome,
             approvalId,
             checks: uiChecks,
+            agentMode,
           }
         : e
     )
@@ -655,7 +876,7 @@ export class SessionController {
       doneIds: this._snap.doneIds.includes(callCtx.id)
         ? this._snap.doneIds
         : [...this._snap.doneIds, callCtx.id],
-      runningId: null,
+      // runningId is cleared only from top-level callers (runLive sets it separately)
       liveMessage,
       alerts,
       interventions,

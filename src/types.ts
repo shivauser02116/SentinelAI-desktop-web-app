@@ -84,6 +84,7 @@ export interface ActionEvent {
   status: EventStatus
   outcome: string | null
   approvalId?: string
+  agentMode?: 'simulated' | 'live'
 }
 
 export interface ApprovalRequest {
@@ -140,6 +141,17 @@ export interface Activity {
   stage: 1 | 2
 }
 
+export interface LiveActivity {
+  request: string
+  untrusted?: {
+    kind: string
+    label: string
+    text?: string
+    injected?: string
+  }
+  agentLines: string[]
+}
+
 export type Access = 'yes' | 'approval' | 'no'
 export interface PolicyRole {
   role: Role
@@ -180,6 +192,10 @@ export interface SessionState {
   pendingCount: number
   alerts: import('./gateway/alerts').Alert[]
   interventions: import('./gateway/alerts').InterventionsSummary
+  mode: 'simulated' | 'live'
+  liveReady: boolean
+  liveError: string | null
+  liveActivity: LiveActivity | null
   runScenario: (id: string) => void
   resolveApproval: (id: string, action: 'approve' | 'deny', note: string) => boolean
   verifyChain: () => void
@@ -188,4 +204,8 @@ export interface SessionState {
   selectEvent: (id: string | null) => void
   dismissToast: () => void
   requestLiveMode: () => void
+  setMode: (mode: 'simulated' | 'live') => void
+  setLiveConfig: (config: { apiKey: string; model?: string }) => void
+  clearLiveConfig: () => void
+  runLive: (input: string) => Promise<void>
 }
