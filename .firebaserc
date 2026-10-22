@@ -1,5 +1,14 @@
 {
   "projects": {
     "default": "sentinelai-prototype-8a"
+  },
+  "targets": {
+    "sentinelai-prototype-8a": {
+      "hosting": {
+        "sentinelai-prototype-8a": [
+          "sentinelai-prototype-8a"
+        ]
+      }
+    }
   }
 }

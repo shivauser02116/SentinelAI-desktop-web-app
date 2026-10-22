@@ -1,5 +1,6 @@
 {
   "hosting": {
+    "site": "sentinelai-prototype-8a",
     "public": "dist",
     "ignore": [
       "firebase.json",
