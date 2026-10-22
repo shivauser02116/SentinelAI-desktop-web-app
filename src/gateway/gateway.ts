@@ -290,6 +290,10 @@ export class Gateway {
     return this._approvals.get(id)
   }
 
+  getApprovals(): ApprovalRecord[] {
+    return Array.from(this._approvals.values())
+  }
+
   reset(): void {
     this.registry.resetCounts()
     this._approvals.clear()
