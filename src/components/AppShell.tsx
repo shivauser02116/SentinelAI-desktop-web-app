@@ -1,6 +1,7 @@
 import { useCallback, useState } from 'react'
 import { useSession } from '../state/useSession'
 import { ApprovalScreen } from '../screens/ApprovalScreen'
+import { AlertsScreen } from '../screens/AlertsScreen'
 import { AuditScreen } from '../screens/AuditScreen'
 import { CheckpointScreen } from '../screens/CheckpointScreen'
 import { PolicyScreen } from '../screens/PolicyScreen'
@@ -21,7 +22,8 @@ export function AppShell() {
       <main className="min-h-0 flex-1">
         {route.name === 'checkpoint' && <CheckpointScreen />}
         {route.name === 'approvals' && <ApprovalScreen id={route.id} />}
-        {route.name === 'audit' && <AuditScreen />}
+        {route.name === 'alerts' && <AlertsScreen />}
+        {route.name === 'audit' && <AuditScreen id={route.id} />}
         {route.name === 'policy' && <PolicyScreen />}
       </main>
       <Toast />

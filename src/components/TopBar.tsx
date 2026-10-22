@@ -10,14 +10,19 @@ import type { RouteName } from './useHashRoute'
 const tabs: { name: RouteName; label: string }[] = [
   { name: 'checkpoint', label: 'Checkpoint' },
   { name: 'approvals', label: 'Approvals' },
+  { name: 'alerts', label: 'Alerts' },
   { name: 'audit', label: 'Audit log' },
   { name: 'policy', label: 'Policy' },
 ]
 
 export function TopBar({ route, onAbout }: { route: RouteName; onAbout: () => void }) {
-  const { pendingCount, reset } = useSession()
+  const { pendingCount, alerts, reset } = useSession()
   const [open, setOpen] = useState(false)
   const wrap = useRef<HTMLDivElement>(null)
+
+  const actionNeeded = alerts.filter((a) => a.state === 'action_needed')
+  const alertsCount = actionNeeded.length
+  const hasHighAlert = actionNeeded.some((a) => a.severity === 'high')
 
   useEffect(() => {
     if (!open) return
@@ -57,6 +62,18 @@ export function TopBar({ route, onAbout }: { route: RouteName; onAbout: () => vo
                   className="min-w-5 rounded-full bg-approval-bg px-1.5 text-center text-xs font-semibold text-approval-fg ring-1 ring-approval-border"
                 >
                   {pendingCount}
+                </span>
+              )}
+              {t.name === 'alerts' && alertsCount > 0 && (
+                <span
+                  aria-label={`${alertsCount} action needed`}
+                  className={`min-w-5 rounded-full px-1.5 text-center text-xs font-semibold ring-1 ${
+                    hasHighAlert
+                      ? 'bg-blocked-bg text-blocked-fg ring-blocked-border'
+                      : 'bg-approval-bg text-approval-fg ring-approval-border'
+                  }`}
+                >
+                  {alertsCount}
                 </span>
               )}
               {active && <span className="absolute inset-x-2 bottom-0 h-0.5 bg-brand" />}

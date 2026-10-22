@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 
-export type RouteName = 'checkpoint' | 'approvals' | 'audit' | 'policy'
+export type RouteName = 'checkpoint' | 'approvals' | 'alerts' | 'audit' | 'policy'
 export interface Route {
   name: RouteName
   id?: string
@@ -10,7 +10,9 @@ function parse(): Route {
   const parts = window.location.hash.replace(/^#\/?/, '').split('/')
   const name = parts[0] as RouteName
   if (name === 'approvals') return { name, id: parts[1] }
-  if (name === 'audit' || name === 'policy' || name === 'checkpoint') return { name }
+  if (name === 'alerts') return { name }
+  if (name === 'audit') return { name, id: parts[1] }
+  if (name === 'policy' || name === 'checkpoint') return { name }
   return { name: 'checkpoint' }
 }
 

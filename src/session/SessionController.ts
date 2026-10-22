@@ -12,6 +12,7 @@ import { verifyChain as gwVerifyChain, type GatewayAuditEntry } from '../gateway
 import { tamperDemo as doTamper, reset as resetTamper } from '../demo/tamper'
 import { SimulatedAgent } from '../agent/simulatedAgent'
 import { SCENARIOS, USERS, RECORDS, DEMO_DATE, GRANT_EXPIRES } from '../data/scenarios'
+import { deriveAlerts, summarizeInterventions, type Alert, type InterventionsSummary } from '../gateway/alerts'
 import type {
   User,
   TaskGrant,
@@ -42,6 +43,8 @@ interface ControllerSnapshot {
   activity: Activity | null
   toast: Toast | null
   liveMessage: string
+  alerts: Alert[]
+  interventions: InterventionsSummary
 }
 
 type SubscriberFn = (snap: ControllerSnapshot) => void
@@ -101,6 +104,38 @@ export class SessionController {
   private readonly _agent: SimulatedAgent
   private readonly _delays: [number, number, number, number, number]
   private readonly _subscribers = new Set<SubscriberFn>()
+  private _previousAlertIds = new Set<string>()
+
+  private _recomputeAlerts(suppressHighToast = false): {
+    alerts: Alert[]
+    interventions: InterventionsSummary
+  } {
+    const entries = this._gw.audit.getAll()
+    const approvals = this._gw.getApprovals()
+    const alerts = deriveAlerts({
+      entries,
+      approvals,
+      chain: { ok: this._snap.chainOk, brokenAt: this._snap.chainBrokenAt },
+    })
+    const interventions = summarizeInterventions(entries)
+
+    if (!suppressHighToast) {
+      const newHigh = alerts.find(
+        (a) => a.severity === 'high' && !this._previousAlertIds.has(a.id),
+      )
+      if (newHigh) {
+        this._showToast({
+          message: `Alert: ${newHigh.title}`,
+          linkLabel: 'View',
+          href: '#/alerts',
+        })
+        this._snap.liveMessage = `Alert: ${newHigh.title}`
+      }
+    }
+
+    this._previousAlertIds = new Set(alerts.map((a) => a.id))
+    return { alerts, interventions }
+  }
 
   private _snap: ControllerSnapshot = {
     currentTask: null,
@@ -116,6 +151,8 @@ export class SessionController {
     activity: null,
     toast: null,
     liveMessage: '',
+    alerts: [],
+    interventions: { blocked: 0, held: 0, approved: 0, denied: 0 },
   }
 
   // Internal tracking maps for approval resolution
@@ -303,7 +340,8 @@ export class SessionController {
       ? `Request approved: ${ap.tool} was executed.`
       : `Request denied: ${ap.tool} was not executed.`
 
-    this._patch({ approvals, events, liveMessage, selectedEventId: ap.eventId })
+    const { alerts, interventions } = this._recomputeAlerts()
+    this._patch({ approvals, events, liveMessage, selectedEventId: ap.eventId, alerts, interventions })
   }
 
   // ── verifyChain ────────────────────────────────────────────────────────────
@@ -315,7 +353,10 @@ export class SessionController {
   private async _verifyChainAsync(): Promise<void> {
     const entries = this._gw.audit.getAll()
     const result = await gwVerifyChain(entries)
-    this._patch({ chainOk: result.ok, chainBrokenAt: result.brokenAt })
+    this._snap.chainOk = result.ok
+    this._snap.chainBrokenAt = result.brokenAt
+    const { alerts, interventions } = this._recomputeAlerts()
+    this._patch({ chainOk: result.ok, chainBrokenAt: result.brokenAt, alerts, interventions })
   }
 
   // ── tamperDemo ─────────────────────────────────────────────────────────────
@@ -330,10 +371,15 @@ export class SessionController {
       return { ...uiE, hash: gwe.hash.substring(0, 8), reason: gwe.reason }
     })
     void gwVerifyChain(gwEntries).then((result) => {
+      this._snap.chainOk = result.ok
+      this._snap.chainBrokenAt = result.brokenAt
+      const { alerts, interventions } = this._recomputeAlerts()
       this._patch({
         auditEntries: uiEntries,
         chainOk: result.ok,
         chainBrokenAt: result.brokenAt,
+        alerts,
+        interventions,
       })
     })
   }
@@ -347,6 +393,7 @@ export class SessionController {
     resetTamper(this._gw.audit)
     this._eventSeq = 0
     this._approvalToScenario.clear()
+    this._previousAlertIds.clear()
     this._currentGrant = null
     this._snap = {
       currentTask: null,
@@ -362,6 +409,8 @@ export class SessionController {
       activity: null,
       toast: null,
       liveMessage: '',
+      alerts: [],
+      interventions: { blocked: 0, held: 0, approved: 0, denied: 0 },
     }
     this._notify()
   }
@@ -569,6 +618,8 @@ export class SessionController {
           ? `Action blocked: ${tool}. The tool was not called.`
           : `Approval needed: ${tool}. Waiting for review.`
 
+    const { alerts, interventions } = this._recomputeAlerts(decision === 'needs_approval')
+
     this._patch({
       events,
       auditEntries: newAuditEntries,
@@ -578,6 +629,8 @@ export class SessionController {
         : [...this._snap.doneIds, sc.id],
       runningId: null,
       liveMessage,
+      alerts,
+      interventions,
     })
   }
 

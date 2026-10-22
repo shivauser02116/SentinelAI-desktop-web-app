@@ -631,6 +631,16 @@ exports[`golden scenario characterization > locks current S1 to S5 behavior 1`] 
       "message": "Approval requested",
     },
     {
+      "href": "#/alerts",
+      "linkLabel": "View",
+      "message": "Alert: payroll.export was blocked",
+    },
+    {
+      "href": "#/alerts",
+      "linkLabel": "View",
+      "message": "Alert: payroll.export was blocked",
+    },
+    {
       "href": "#/approvals/APR-002",
       "linkLabel": "Review",
       "message": "Approval requested",

@@ -155,6 +155,13 @@ export interface PolicySettings {
   grantExample: string
 }
 
+export type {
+  Alert,
+  AlertSeverity,
+  AlertState,
+  InterventionsSummary,
+} from './gateway/alerts'
+
 export interface SessionState {
   currentTask: TaskGrant | null
   currentUser: User
@@ -171,6 +178,8 @@ export interface SessionState {
   toast: Toast | null
   liveMessage: string
   pendingCount: number
+  alerts: import('./gateway/alerts').Alert[]
+  interventions: import('./gateway/alerts').InterventionsSummary
   runScenario: (id: string) => void
   resolveApproval: (id: string, action: 'approve' | 'deny', note: string) => boolean
   verifyChain: () => void

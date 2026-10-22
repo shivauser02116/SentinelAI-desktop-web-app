@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useSession } from '../state/useSession'
 import type { AuditEntry, Decision } from '../types'
 import { AuditDrawer } from '../components/AuditDrawer'
@@ -15,10 +15,22 @@ const filters: { value: 'all' | Decision; label: string }[] = [
   { value: 'blocked', label: 'Blocked' },
 ]
 
-export function AuditScreen() {
+export function AuditScreen({ id }: { id?: string } = {}) {
   const { auditEntries, chainStatus, tamperDemo } = useSession()
   const [filter, setFilter] = useState<'all' | Decision>('all')
-  const [open, setOpen] = useState<AuditEntry | null>(null)
+  const [open, setOpen] = useState<AuditEntry | null>(() => {
+    if (!id) return null
+    const n = parseInt(id, 10)
+    return auditEntries.find((e) => e.seq === n) ?? null
+  })
+
+  useEffect(() => {
+    if (id) {
+      const n = parseInt(id, 10)
+      const found = auditEntries.find((e) => e.seq === n)
+      if (found) setOpen(found)
+    }
+  }, [id, auditEntries])
   const rows = auditEntries.filter((e) => filter === 'all' || e.decision === filter)
 
   const exportJson = () => {
