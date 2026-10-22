@@ -29,6 +29,38 @@ import type { ToolCall, EvalContext, Role } from '../gateway/types'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+export interface CallContext {
+  id: string
+  number: number
+  time: string
+  user: User
+  taskId: string
+  taskTitle?: string
+  call: {
+    tool: ToolName
+    args: Record<string, unknown>
+    summary: string
+    source: {
+      kind: 'request' | 'untrusted'
+      label: string
+      text?: string
+      injected?: string
+    }
+  }
+  decision?: 'allowed' | 'needs_approval' | 'blocked'
+  rule?: string
+  reason?: string
+  checks?: Check[]
+  approvalSentence?: string
+  resolvedTime?: string
+  grant?: {
+    userId?: string
+    allowTools?: ToolName[]
+    allowResources?: string[]
+    resourceLabel?: string
+  }
+}
+
 interface ControllerSnapshot {
   currentTask: TaskGrant | null
   currentUser: User
@@ -77,7 +109,7 @@ function formatTimeLeft(expiresAt: Date): string {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')} left`
 }
 
-function grantFor(sc: (typeof SCENARIOS)[0]) {
+export function grantFor(sc: { id?: string; taskId: string; grant?: { userId: string; allowTools: ToolName[]; allowResources: string[]; resourceLabel?: string } }) {
   if (sc.grant) {
     return issueGrant({
       taskId: sc.taskId,
@@ -156,7 +188,7 @@ export class SessionController {
   }
 
   // Internal tracking maps for approval resolution
-  private _approvalToScenario = new Map<string, string>() // approvalId → scenarioId
+  private _approvalToCallContext = new Map<string, CallContext>() // approvalId → callCtx
   private _currentGrant: ReturnType<typeof issueGrant> | null = null
   private _countdownInterval: ReturnType<typeof setInterval> | null = null
   private _toastTimeout: ReturnType<typeof setTimeout> | null = null
@@ -244,32 +276,8 @@ export class SessionController {
     }
     this._patch({ events: [...this._snap.events, evaluatingEvent] })
 
-    // Run gateway
-    const toolCall: ToolCall = {
-      tool: sc.call.tool,
-      args: sc.call.args as Record<string, unknown>,
-      provenance: {
-        label: sc.call.source.label,
-        untrusted: sc.call.source.kind === 'untrusted',
-      },
-    }
-    const evalCtx: EvalContext = {
-      user: { id: gwUser.id, name: gwUser.name, role: gwUser.role },
-      grant: gwGrant,
-      agentMode: 'simulated',
-    }
-    const result = await this._gw.submit(toolCall, evalCtx, { eventId })
-
-    // Update event status
-    const eventStatus = this._decisionToEventStatus(result.decision)
-    this._patch({
-      events: this._snap.events.map((e) =>
-        e.id === eventId ? { ...e, status: eventStatus } : e
-      ),
-    })
-
-    // Finalize
-    await this._finalize(sc, eventId, result, gwGrant)
+    // Run gateway submit & status update & finalize via _processCall
+    await this._processCall(sc, eventId, gwGrant, gwUser, 'simulated')
   }
 
   // ── resolveApproval ────────────────────────────────────────────────────────
@@ -291,9 +299,8 @@ export class SessionController {
     cleanNote: string,
     ap: ApprovalRequest,
   ): Promise<void> {
-    const scenarioId = this._approvalToScenario.get(id)
-    const sc = SCENARIOS.find((s) => s.id === scenarioId)
-    if (!sc) return
+    const callCtx = this._approvalToCallContext.get(id)
+    if (!callCtx) return
 
     const gwReviewer = getUser(ap.reviewer.id)
     if (!gwReviewer) return
@@ -307,14 +314,14 @@ export class SessionController {
     if (!resolveResult.ok) return
 
     const approve = action === 'approve'
-    const outcome = this._buildResolvedOutcome(sc, action, cleanNote, ap, resolveResult)
+    const outcome = this._buildResolvedOutcome(callCtx, action, cleanNote, ap, resolveResult)
 
     // Map audit entry
     const auditEntries = this._snap.auditEntries
     if (resolveResult.auditEntry) {
       const uiEntry = this._mapAuditEntry(
         resolveResult.auditEntry,
-        sc,
+        callCtx,
         action,
         cleanNote,
         ap.reviewer,
@@ -392,7 +399,7 @@ export class SessionController {
     this._gw.reset()
     resetTamper(this._gw.audit)
     this._eventSeq = 0
-    this._approvalToScenario.clear()
+    this._approvalToCallContext.clear()
     this._previousAlertIds.clear()
     this._currentGrant = null
     this._snap = {
@@ -491,43 +498,64 @@ export class SessionController {
       }
       this._patch({ events: [...this._snap.events, evaluatingEvent] })
 
-      // Run the gateway submit async
-      const toolCall: ToolCall = {
-        tool: sc.call.tool,
-        args: sc.call.args as Record<string, unknown>,
-        provenance: {
-          label: sc.call.source.label,
-          untrusted: sc.call.source.kind === 'untrusted',
-        },
-      }
-      const evalCtx: EvalContext = {
-        user: { id: gwUser.id, name: gwUser.name, role: gwUser.role },
-        grant: gwGrant,
-        agentMode: 'simulated',
-      }
-      void this._gw.submit(toolCall, evalCtx, { eventId }).then((result) => {
-        // t≈d0+d1+d2: update event status
-        this._scheduleTimeout(() => {
-          const eventStatus = this._decisionToEventStatus(result.decision)
-          this._patch({
-            events: this._snap.events.map((e) =>
-              e.id === eventId ? { ...e, status: eventStatus } : e
-            ),
-          })
-
-          // t≈d0+d1+d2+d3: finalize
-          this._scheduleTimeout(() => {
-            void this._finalize(sc, eventId, result, gwGrant)
-          }, d3)
-        }, d2)
-      })
+      // Run gateway submit & status update & finalize via _processCall
+      void this._processCall(sc, eventId, gwGrant, gwUser, 'simulated', { dStatus: d2, dFinalize: d3 })
     }, d0 + d1)
+  }
+
+  // ── Internal: processCall ──────────────────────────────────────────────────
+
+  private async _processCall(
+    callCtx: CallContext,
+    eventId: string,
+    grant: ReturnType<typeof issueGrant>,
+    gwUser: ReturnType<typeof getUser>,
+    agentMode: 'simulated' | 'live',
+    delays?: { dStatus: number; dFinalize: number },
+  ): Promise<Awaited<ReturnType<Gateway['submit']>>> {
+    const toolCall: ToolCall = {
+      tool: callCtx.call.tool,
+      args: callCtx.call.args as Record<string, unknown>,
+      provenance: {
+        label: callCtx.call.source.label,
+        untrusted: callCtx.call.source.kind === 'untrusted',
+      },
+    }
+    const evalCtx: EvalContext = {
+      user: { id: gwUser!.id, name: gwUser!.name, role: gwUser!.role },
+      grant,
+      agentMode,
+    }
+    const result = await this._gw.submit(toolCall, evalCtx, { eventId })
+
+    const updateStatus = () => {
+      const eventStatus = this._decisionToEventStatus(result.decision)
+      this._patch({
+        events: this._snap.events.map((e) =>
+          e.id === eventId ? { ...e, status: eventStatus } : e
+        ),
+      })
+    }
+
+    if (delays && (delays.dStatus > 0 || delays.dFinalize > 0)) {
+      this._scheduleTimeout(() => {
+        updateStatus()
+        this._scheduleTimeout(() => {
+          void this._finalize(callCtx, eventId, result, grant)
+        }, delays.dFinalize)
+      }, delays.dStatus)
+    } else {
+      updateStatus()
+      await this._finalize(callCtx, eventId, result, grant)
+    }
+
+    return result
   }
 
   // ── Internal: finalize ─────────────────────────────────────────────────────
 
   private async _finalize(
-    sc: (typeof SCENARIOS)[0],
+    callCtx: CallContext,
     eventId: string,
     result: Awaited<ReturnType<Gateway['submit']>>,
     gwGrant: ReturnType<typeof issueGrant>,
@@ -541,7 +569,7 @@ export class SessionController {
       approvalId = result.approvalId
 
       // Build pending outcome text
-      const requiredReviewerRole = getRequiredReviewerRole(sc.user.role as Role) ?? 'Ops Manager'
+      const requiredReviewerRole = getRequiredReviewerRole(callCtx.user.role as Role) ?? 'Ops Manager'
       const reviewerGwUser = getUserByRole(requiredReviewerRole as Role)
       outcome = reviewerGwUser
         ? `Waiting for approval from ${reviewerGwUser.name} (${reviewerGwUser.role}).`
@@ -553,21 +581,21 @@ export class SessionController {
       const uiApproval: ApprovalRequest = {
         id: approvalId!,
         eventId,
-        scenarioId: sc.id,
-        title: sc.approvalSentence ?? sc.call.summary,
-        requester: sc.user,
+        scenarioId: callCtx.id,
+        title: callCtx.approvalSentence ?? callCtx.call.summary,
+        requester: callCtx.user,
         reviewer: uiReviewer,
-        taskId: sc.taskId,
-        tool: sc.call.tool,
-        args: sc.call.args as Record<string, ArgValue>,
-        reason: sc.reason,
-        requestedAt: sc.time,
+        taskId: callCtx.taskId,
+        tool: callCtx.call.tool,
+        args: callCtx.call.args as Record<string, ArgValue>,
+        reason: callCtx.reason ?? result.reason,
+        requestedAt: callCtx.time,
         status: 'pending',
         note: null,
         outcome,
       }
 
-      this._approvalToScenario.set(approvalId!, sc.id)
+      this._approvalToCallContext.set(approvalId!, callCtx)
 
       const approvals = [...this._snap.approvals, uiApproval]
       this._patch({ approvals })
@@ -578,7 +606,7 @@ export class SessionController {
         href: `#/approvals/${approvalId}`,
       })
     } else {
-      outcome = this._buildOutcome(sc, result)
+      outcome = this._buildOutcome(callCtx, result)
     }
 
     const uiChecks: Check[] = result.checks.map((c) => ({
@@ -606,11 +634,11 @@ export class SessionController {
     const auditEntries = this._snap.auditEntries
     let newAuditEntries = auditEntries
     if (result.auditEntry) {
-      const uiEntry = this._mapAuditEntry(result.auditEntry, sc, undefined, undefined, undefined)
+      const uiEntry = this._mapAuditEntry(result.auditEntry, callCtx, undefined, undefined, undefined)
       newAuditEntries = [...auditEntries, uiEntry]
     }
 
-    const tool = sc.call.tool
+    const tool = callCtx.call.tool
     const liveMessage =
       decision === 'allowed'
         ? `Action allowed: ${tool}.`
@@ -624,9 +652,9 @@ export class SessionController {
       events,
       auditEntries: newAuditEntries,
       selectedEventId: eventId,
-      doneIds: this._snap.doneIds.includes(sc.id)
+      doneIds: this._snap.doneIds.includes(callCtx.id)
         ? this._snap.doneIds
-        : [...this._snap.doneIds, sc.id],
+        : [...this._snap.doneIds, callCtx.id],
       runningId: null,
       liveMessage,
       alerts,
@@ -672,16 +700,16 @@ export class SessionController {
 
   private _mapAuditEntry(
     gae: GatewayAuditEntry,
-    sc: (typeof SCENARIOS)[0],
+    callCtx: CallContext,
     action?: 'approve' | 'deny',
     note?: string,
     reviewerUser?: User,
   ): AuditEntry {
-    const result = this._buildResultText(gae, sc, action, note, reviewerUser ?? undefined)
+    const result = this._buildResultText(gae, callCtx, action, note, reviewerUser ?? undefined)
     return {
       seq: gae.index,
       date: DEMO_DATE,
-      time: sc.resolvedTime && action ? sc.resolvedTime : sc.time,
+      time: callCtx.resolvedTime && action ? callCtx.resolvedTime : callCtx.time,
       requestedBy: gae.user.name,
       role: gae.user.role,
       taskId: gae.taskId,
@@ -700,7 +728,7 @@ export class SessionController {
 
   private _buildResultText(
     gae: GatewayAuditEntry,
-    sc: (typeof SCENARIOS)[0],
+    callCtx: CallContext,
     action?: 'approve' | 'deny',
     note?: string,
     reviewerUser?: User,
@@ -733,7 +761,7 @@ export class SessionController {
     }
 
     if (decision === 'needs_approval') {
-      const requiredReviewerRole = getRequiredReviewerRole(sc.user.role as Role) ?? 'Ops Manager'
+      const requiredReviewerRole = getRequiredReviewerRole(callCtx.user.role as Role) ?? 'Ops Manager'
       const rwUser = getUserByRole(requiredReviewerRole as Role)
       return rwUser
         ? `Waiting for approval from ${rwUser.name} (${rwUser.role}).`
@@ -756,21 +784,21 @@ export class SessionController {
   }
 
   private _buildOutcome(
-    sc: (typeof SCENARIOS)[0],
+    callCtx: CallContext,
     result: Awaited<ReturnType<Gateway['submit']>>,
   ): string {
     if (result.decision === 'blocked') {
       return 'Not executed. The tool was never called and no data left the system.'
     }
     if (result.decision === 'allowed') {
-      const tool = sc.call.tool
+      const tool = callCtx.call.tool
       if (tool === 'invoice.lookup') {
         return 'Executed. Returned invoice INV-1042: ₹73,000, Paid, 3 line items. The add-on appears twice.'
       }
       if (tool === 'refund.issue') {
         const exResult = result.execution.result as Record<string, unknown> | undefined
         const refundId = (exResult?.refund_id as string) ?? ''
-        const amount = (sc.call.args['amount'] as number) ?? 0
+        const amount = (callCtx.call.args['amount'] as number) ?? 0
         return `Executed. Refund ${refundId} for ₹${amount.toLocaleString('en-IN')} created in the mock payment system.`
       }
     }
@@ -778,7 +806,7 @@ export class SessionController {
   }
 
   private _buildResolvedOutcome(
-    sc: (typeof SCENARIOS)[0],
+    callCtx: CallContext,
     action: 'approve' | 'deny',
     note: string,
     ap: ApprovalRequest,
